@@ -1,0 +1,21 @@
+# Configuración personal (contiene REDMINE_API_KEY)
+imputar-redmine.conf
+*.conf
+
+# Festivos propios del usuario
+festivos.json
+festivos.json.*
+
+# Caché local de festivos oficiales y listados de localidades (se autogeneran)
+calendario/
+.cache/
+
+# Ficheros temporales de sistema / editores
+*~
+*.swp
+*.bak
+.DS_Store
+.idea/
+.vscode/
+
+

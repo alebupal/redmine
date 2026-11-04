@@ -1,0 +1,28 @@
+# Configuración de imputar-redmine.sh (se puede editar a mano; formato CLAVE=valor)
+# Copia este fichero a imputar-redmine.conf (chmod 600) o ejecuta ./imputar-redmine.sh para lanzar el asistente.
+#
+# REDMINE_URL      URL base de Redmine (ej: https://redmine.ejemplo.com)
+# REDMINE_API_KEY  Clave de la API (Redmine → Mi cuenta → Clave de acceso a la API)
+# TASK_ID          Tarea donde se imputa el trabajo (ej: 12345)
+# VAC_ID           Tarea de vacaciones (ej: 10000)
+# HOURS            Horas por día laborable (ej: 8 o 7.5)
+# TASK_ACTIVITY    Id de actividad para la tarea (vacío = la de por defecto)
+# VAC_ACTIVITY     Id de actividad para vacaciones
+# COMMENT          Comentario por defecto de la tarea
+# VAC_COMMENT      Comentario por defecto de vacaciones
+# CAL_CCAA/CAL_PROV/CAL_MUN  Localidad para festivos en calendariosnacionales.com (ej: and / granada / granada)
+# Los festivos propios (añadidos o anulados) van aparte, en festivos.json
+REDMINE_URL=
+REDMINE_API_KEY=
+TASK_ID=
+VAC_ID=
+HOURS=8
+TASK_ACTIVITY=
+VAC_ACTIVITY=
+COMMENT=
+VAC_COMMENT=Vacaciones
+CAL_CCAA=
+CAL_PROV=
+CAL_MUN=
+CAL_LABEL=
+
