@@ -33,7 +33,7 @@ Este documento incluye tanto la **guía de instalación y uso** como la **docume
   - Imputa los días de vacaciones en una tarea aparte.
   - Si un día ya tiene horas, imputa solo las que faltan. Se puede relanzar sin duplicar.
   - Selector interactivo de tareas abiertas asignadas en Redmine (escribiendo `?` o `l`).
-  - Modo rápido sin preguntas (`-y` / `--yes` o tecla `d` para imputar hoy en un paso).
+  - Modo rápido sin preguntas (`-y` / `--yes` o tecla `d` para imputar hoy en un paso). Con `-y` nunca imputa días futuros y aborta si los festivos no son fiables (no se pudieron cargar o faltan los locales).
   - Antes de enviar nada muestra el plan y pide confirmación, e informa del progreso `[i/N]`.
 - **Ver horas imputadas** de un mes: cuadrícula de calendario mensual coloreada, detalle día a día distinguiendo tareas y vacaciones, total por tarea y resumen con barra de progreso del mes completo y hasta hoy.
 - **Borrar y editar imputaciones** existentes del mes directamente vía API (`DELETE` / `PUT`) sin entrar en la web de Redmine.
@@ -141,8 +141,8 @@ El script es un único fichero dividido en secciones con cabeceras `# ------…-
 |---|---|---|
 | *(cabecera)* | `set -euo pipefail`, locale, rutas, colores | — |
 | **configuración (valores por defecto)** | `CONFIG_KEYS`, valores por defecto y **todo el estado global** | — |
-| **utilidades e interfaz visual** | Mensajes, cajas Unicode, barras de progreso, preguntas, cálculo decimal, carga y guardado del `.conf` | `ui_box`, `ui_hr`, `progress_bar`, `ask`, `confirm`, `confirm_no`, `pad`, `calc`, `is_gt`, `load_config`, `save_config` |
-| **API Redmine** | HTTP con API key (`GET`, `POST`, `PUT`, `DELETE`), caché de tareas, selector de tareas asignadas, actividades, lectura de imputaciones | `api_get`, `api_post`, `api_put`, `api_delete`, `ensure_api`, `fetch_issue`, `select_assigned_issue`, `pick_issue`, `resolve_activity`, `fetch_entries` |
+| **utilidades e interfaz visual** | Mensajes, cajas Unicode, barras de progreso, preguntas, cálculo decimal, carga y guardado del `.conf` | `ui_box`, `ui_hr`, `progress_bar`, `ask`, `confirm`, `confirm_no`, `pad`, `calc`, `is_gt`, `valid_hours`, `load_config`, `save_config` |
+| **API Redmine** | HTTP con API key (`GET`, `POST`, `PUT`, `DELETE`), caché de tareas, selector de tareas asignadas, actividades, lectura de imputaciones | `api_curl`, `api_get`, `api_send`, `api_errors`, `ensure_api`, `fetch_issue`, `select_assigned_issue`, `pick_issue`, `resolve_activity`, `fetch_entries` |
 | **días y festivos** | Lectura y validación de días, horas, mes y rango | `parse_days`, `ask_days`, `ask_hours`, `ask_month`, `ask_range`, `change_month` |
 | **calendario laboral** | calendariosnacionales.com, copia local, selector de localidad, festivos propios, carga de festivos de un mes | `cal_download`, `cal_holidays_json`, `cal_holiday_lines`, `cal_update`, `select_location`, `pick_option`, `load_holidays`, `add_holiday` |
 | **imputar** | Periodos (mes, semana, día…), festivos de un rango, plan, POST con progreso y resumen | `choose_period`, `parse_date`, `load_holidays_range`, `cmd_imputar`, `cmd_imputar_hoy_rapido`, `print_totals_by_issue` |
@@ -233,9 +233,10 @@ Autenticación con la cabecera `X-Redmine-API-Key`. Endpoints usados:
 >
 > Por los corchetes, `curl` necesita `-g` (sin interpretación de patrones). Ya lo hace `api_get`.
 >
-> `fetch_entries` tiene además dos protecciones:
+> `fetch_entries` tiene además estas protecciones:
+> - Si una página no es JSON o no trae `time_entries` (lista) y `total_count` (número), aborta: tomarla como «nada imputado» duplicaría horas.
 > - Si `total_count > 1000`, aborta.
-> - Filtra por `user.id == USER_ID`.
+> - Filtra por `user.id == USER_ID` y por `spent_on` dentro del rango pedido.
 >
 > No las quites.
 
@@ -282,7 +283,7 @@ Formato `CLAVE=valor`, una línea por clave, sin comillas. Se **lee con `sed`, n
 | `REDMINE_API_KEY` | — | Secreta. |
 | `TASK_ID` | `12345` | Tarea principal. |
 | `VAC_ID` | `10000` | Tarea de vacaciones. |
-| `HOURS` | `8` | Admite decimales (`7.5`). |
+| `HOURS` | `8` | Admite decimales (`7.5` o `7,5`). Se valida al cargar (mayor que 0 y hasta 24): si no es válido, el script se detiene con un error. |
 | `TASK_ACTIVITY` / `VAC_ACTIVITY` | `9` | Id de actividad. Vacío = la de por defecto de Redmine. |
 | `COMMENT` / `VAC_COMMENT` | `Vacaciones` | Comentarios por defecto. |
 | `CAL_CCAA` / `CAL_PROV` / `CAL_MUN` | `and` / `granada` / `granada` | *Slugs* de calendariosnacionales.com. Sin valor por defecto: se eligen en el asistente o en Configuración → Localidad. |
@@ -330,7 +331,8 @@ Convenciones del código:
 
 - **Mensajes**: `info` (ℹ), `ok` (✔), `warn` (⚠), `die` (✖ y salida), `title` (cabecera). Dentro de una función cuya stdout se captura con `$(...)`, usa `>&2` en los mensajes.
 - **Preguntas**: `ask "texto" [defecto]` devuelve la respuesta por stdout y muestra la pregunta por stderr (`read -p`). `confirm` = sí por defecto, `confirm_no` = no por defecto. `read_key` es para menús de una tecla.
-- **Decimales**: Bash no tiene coma flotante. Usa siempre `calc "expr"` y `is_gt a b` (awk).
+- **Decimales**: Bash no tiene coma flotante. Usa siempre `calc "expr"` y `is_gt a b` (awk). `calc` solo admite números, `+`, `-` y `*` (la expresión se pasa con `awk -v`, nunca como código).
+- **Fechas**: la aritmética con fechas `AAAA-MM-DD` se hace con `ddate` (`date` en UTC), para que un cambio de hora a medianoche no rompa `+1 day`.
 - **Alineación**: `printf '%-20s'` cuenta *bytes* y descuadra con tildes. Usa `pad "texto" ancho`, que cuenta letras.
 - **Pantalla**: `clear_screen`, nunca `clear` (ver trampas).
 - **Comentarios de función**: `nombre() { # uso -> resultado`. Mantén ese estilo.
@@ -416,6 +418,7 @@ Para comprobar el aviso de cambios de festivos, altera a mano un fichero de `cal
 - `imputar-redmine.conf` contiene la **API key**: se crea con `umask 077` y `chmod 600`. No lo compartas, no lo subas a ningún repositorio y no lo pegues en tickets.
 - El `.conf` se lee con `sed`, sin `source`, así que nada de lo que contenga se ejecuta.
 - La key se pide sin eco (`read -s`) y solo se envía a `REDMINE_URL` en la cabecera `X-Redmine-API-Key`. No se escribe nunca en pantalla ni en logs.
+- La key **no va en los argumentos de `curl`** (que cualquier usuario del equipo ve con `ps`): `api_curl` se la pasa con `-K` desde una sustitución de proceso. El cuerpo JSON de `POST`/`PUT` va por la entrada estándar (`--data-binary @-`).
 - El script debería tener permisos `755` (o `700`). Si está con permisos de escritura para todos (`777`), cualquier usuario del equipo podría modificarlo y robar la key.
 - Si añades llamadas a servicios externos, **no envíes nunca la API key** fuera de Redmine.
 
@@ -426,5 +429,6 @@ Para comprobar el aviso de cambios de festivos, altera a mano un fichero de `cal
 - **Una sola jornada** (`HOURS`) para todos los días: no hay jornada intensiva ni viernes distinto.
 - **Una tarea por día en imputación masiva**: el resto de horas del día va a la tarea principal o a la de vacaciones. Para repartir un día entre varias tareas, imputa por día con horas parciales o edita desde `cmd_gestionar` (`-b`).
 - **Medios días de vacaciones**: no hay opción específica en el modo de mes completo; impútalo con la opción de día y horas parciales.
-- Los festivos locales del año siguiente dependen de cuándo los publique la API. Hasta entonces, el script avisa y se pueden añadir como propios.
+- Los festivos locales del año siguiente dependen de cuándo los publique la API. Hasta entonces, el script avisa y se pueden añadir como propios (con `-y` no imputa hasta que estén publicados: ejecútalo sin `-y`).
+- La copia local de festivos no se actualiza sola: si la del año en curso tiene más de 30 días, el script avisa para que la actualices con `-u`.
 - Solo funciona con GNU `date` (Linux). En macOS habría que adaptarlo a `gdate`.

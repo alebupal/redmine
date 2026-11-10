@@ -14,6 +14,7 @@ CAL_API="https://calendariosnacionales.com/es/v1"
 CAL_DIR="$SCRIPT_DIR/calendario"   # copia local de los festivos descargados (se lee siempre de aquí)
 CACHE_DIR="$SCRIPT_DIR/.cache"     # listados de comunidades/provincias/localidades
 CAL_CACHE_DAYS=7
+CAL_LOCAL_MAX_DAYS=30              # a partir de aquí se avisa de que la copia local de festivos puede estar desfasada
 
 C_RESET=$'\e[0m'; C_BOLD=$'\e[1m'; C_RED=$'\e[31m'; C_GREEN=$'\e[32m'
 C_YELLOW=$'\e[33m'; C_BLUE=$'\e[34m'; C_CYAN=$'\e[36m'; C_DIM=$'\e[2m'
@@ -56,7 +57,7 @@ M_DAY_LINES=(); M_MISSING=(); M_EXTRA=(); M_FUTURE=0; M_MISSING_HOURS=0
 M_WORK_DAYS=0; M_WORK_DAYS_TD=0; M_HOL_WEEKDAY=0
 M_EXPECTED=0; M_EXPECTED_TD=0; M_IMPUTED=0; M_IMPUTED_TD=0; M_WEEKEND=0
 declare -A M_CAL_STATE=()
-declare -A HOLIDAY=() HOLIDAY_SRC=() RANGE_HOL=()
+declare -A HOLIDAY=() HOLIDAY_SRC=() RANGE_HOL=() CAL_STALE_WARNED=()
 RANGE_DATES=(); PERIOD=""; PERIOD_LABEL=""; FROM_DATE=""; TO_DATE=""
 HOLIDAYS_NO_LOCAL=0
 HOLIDAY_DATE_RE='^([0-9]{4}-)?(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])$'
@@ -64,7 +65,9 @@ HOLIDAY_DATE_RE='^([0-9]{4}-)?(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])$'
 TMP_RESP=$(mktemp)
 TMP_FILES=("$TMP_RESP")
 cleanup() { rm -f "${TMP_FILES[@]}"; }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # ---------------------------------------------------------------- utilidades e interfaz visual
 die()  { echo "${C_RED}✖ $*${C_RESET}" >&2; exit 1; }
@@ -127,8 +130,25 @@ confirm() {
 confirm_no() { local a; read -r -p "$1 [s/N]: " a; [[ "$a" =~ ^[sSyY] ]]; }
 pause() { read -r -p "${C_DIM}Pulsa Intro para continuar…${C_RESET}" _; }
 
-calc() { awk "BEGIN { printf \"%g\", $1 }"; }
+calc() { # calc "expr" -> resultado; solo números, + - * (la expresión va por -v, nunca como código awk)
+    awk -v e="$1" '
+        function num() {
+            if (match(s, /^-?[0-9]+(\.[0-9]+)?([eE][-+]?[0-9]+)?/)) { v = substr(s, 1, RLENGTH); s = substr(s, RLENGTH + 1); return v + 0 }
+            bad = 1; return 0
+        }
+        function term(   t) { t = num(); while (!bad && substr(s, 1, 1) == "*") { s = substr(s, 2); t *= num() } return t }
+        BEGIN {
+            s = e; gsub(/[ \t]/, "", s); r = term()
+            while (!bad && s != "") {
+                op = substr(s, 1, 1); s = substr(s, 2)
+                if (op == "+") r += term(); else if (op == "-") r -= term(); else bad = 1
+            }
+            if (bad) { print "calc: expresión no válida: " e > "/dev/stderr"; exit 1 }
+            printf "%g", r
+        }'
+}
 is_gt() { awk -v a="$1" -v b="$2" 'BEGIN { exit !(a > b) }'; }
+valid_hours() { [[ "$1" =~ ^[0-9]+(\.[0-9]+)?$ ]] && is_gt "$1" 0 && ! is_gt "$1" 24; } # horas de un día: >0 y <=24
 
 load_config() {
     local k val
@@ -136,10 +156,15 @@ load_config() {
         for k in "${CONFIG_KEYS[@]}"; do
             if grep -q "^$k=" "$CONFIG_FILE"; then
                 val=$(sed -n "s/^$k=//p" "$CONFIG_FILE" | tail -1)
+                val="${val%$'\r'}"   # fichero editado en Windows
+                if [[ "$val" =~ ^\"(.*)\"$ || "$val" =~ ^\'(.*)\'$ ]]; then val="${BASH_REMATCH[1]}"; fi
                 printf -v "$k" '%s' "$val"
             fi
         done
     fi
+    HOURS="${HOURS/,/.}"
+    valid_hours "$HOURS" \
+        || die "HOURS no válido en $CONFIG_FILE: «$HOURS» (número mayor que 0 y hasta 24, p. ej. 8 o 7.5)"
     REDMINE_URL="${ENV_REDMINE_URL:-$REDMINE_URL}"
     REDMINE_URL="${REDMINE_URL%/}"
     API_KEY="${ENV_API_KEY:-$REDMINE_API_KEY}"
@@ -170,25 +195,24 @@ EOF
 }
 
 # ---------------------------------------------------------------- API Redmine
+api_curl() { # api_curl args… -> curl con la API key en un fichero de config (-K): no aparece en la lista de procesos
+    local k="${API_KEY//\\/\\\\}"
+    k="${k//\"/\\\"}"
+    curl -K <(printf 'header = "X-Redmine-API-Key: %s"\n' "$k") "$@"
+}
+
 api_get() {
-    curl -fsSg --max-time 30 -H "X-Redmine-API-Key: $API_KEY" -H "Accept: application/json" "$REDMINE_URL$1"
+    api_curl -fsSg --max-time 30 -H "Accept: application/json" "$REDMINE_URL$1"
 }
 
-api_post() { # api_post ruta json -> código HTTP (cuerpo en $TMP_RESP)
-    curl -sS --max-time 30 -o "$TMP_RESP" -w '%{http_code}' -X POST \
-        -H "X-Redmine-API-Key: $API_KEY" -H "Content-Type: application/json" \
-        -d "$2" "$REDMINE_URL$1"
+api_send() { # api_send METODO ruta [json] -> código HTTP (cuerpo de la respuesta en $TMP_RESP; el JSON va por stdin)
+    local -a body=()
+    (( $# >= 3 )) && body=(-H "Content-Type: application/json" --data-binary @-)
+    api_curl -sSg --max-time 30 -o "$TMP_RESP" -w '%{http_code}' -X "$1" "${body[@]}" "$REDMINE_URL$2" <<<"${3:-}"
 }
 
-api_put() { # api_put ruta json -> código HTTP (cuerpo en $TMP_RESP)
-    curl -sS --max-time 30 -o "$TMP_RESP" -w '%{http_code}' -X PUT \
-        -H "X-Redmine-API-Key: $API_KEY" -H "Content-Type: application/json" \
-        -d "$2" "$REDMINE_URL$1"
-}
-
-api_delete() { # api_delete ruta -> código HTTP (cuerpo en $TMP_RESP)
-    curl -sS --max-time 30 -o "$TMP_RESP" -w '%{http_code}' -X DELETE \
-        -H "X-Redmine-API-Key: $API_KEY" "$REDMINE_URL$1"
+api_errors() { # mensajes de error de la última respuesta de Redmine ($TMP_RESP), separados por comas
+    jq -r '(.errors // []) | join(", ")' "$TMP_RESP" 2>/dev/null || true
 }
 
 ensure_api() { # pide/valida la URL y la API key una vez por sesión
@@ -268,10 +292,11 @@ select_assigned_issue() { # selector interactivo de tareas abiertas asignadas al
     echo "${choice%%|*}"
 }
 
-ask_issue() { # ask_issue "pregunta" [defecto] -> id
+ask_issue() { # ask_issue "pregunta" [defecto] [vacío_ok] -> id ("" si vacío_ok y no se escribe nada)
     local raw id label
     while true; do
         raw=$(ask "$1 ('?' = mis tareas)" "${2:-}")
+        if [[ -z "$raw" && -n "${3:-}" ]]; then echo ""; return 0; fi
         if [[ "$raw" == "?" || "${raw,,}" == "l" ]]; then
             if id=$(select_assigned_issue); then
                 echo "$id"
@@ -336,14 +361,22 @@ resolve_activity() { # usa la configurada si es válida; si no, la pregunta
 
 fetch_entries() { # fetch_entries desde hasta -> "fecha issue_id horas entry_id actividad|comentario" de mis imputaciones
     # Algunas instancias de Redmine ignoran user_id/from/to sueltos: hay que usar la sintaxis de filtros f[]/op/v
-    local offset=0 total page
+    # Si una página no es la respuesta esperada se aborta: tomarla como «nada imputado» duplicaría horas.
+    local offset=0 total page lines
     local filter="f[]=spent_on&op[spent_on]=><&v[spent_on][]=$1&v[spent_on][]=$2&f[]=user_id&op[user_id]==&v[user_id][]=me"
     while :; do
         page=$(api_get "/time_entries.json?$filter&limit=100&offset=$offset") || return 1
-        total=$(jq -r '.total_count // 0' <<<"$page")
+        if ! jq -e '(.time_entries | type == "array") and (.total_count | type == "number")' <<<"$page" >/dev/null 2>&1; then
+            warn "Respuesta inesperada de Redmine al leer las imputaciones (no es JSON o falta time_entries/total_count)" >&2
+            return 1
+        fi
+        total=$(jq -r '.total_count | floor' <<<"$page")
         if (( total > 1000 )); then warn "Redmine devuelve $total imputaciones: el filtro no se está aplicando" >&2; return 1; fi
-        jq -r --argjson uid "$USER_ID" '.time_entries[] | select(.user.id == $uid)
-            | "\(.spent_on) \(.issue.id // "-") \(.hours) \(.id) \((.activity.name // "-") | gsub("[|\\r\\n]+"; " "))|\((.comments // "") | gsub("[|\\r\\n]+"; " "))"' <<<"$page"
+        lines=$(jq -r --argjson uid "$USER_ID" --arg from "$1" --arg to "$2" '.time_entries[]
+            | select(.user.id == $uid and .spent_on >= $from and .spent_on <= $to)
+            | "\(.spent_on) \(.issue.id // "-") \(.hours) \(.id) \((.activity.name // "-") | gsub("[|\\r\\n]+"; " "))|\((.comments // "") | gsub("[|\\r\\n]+"; " "))"' <<<"$page") \
+            || { warn "No se pudieron interpretar las imputaciones devueltas por Redmine" >&2; return 1; }
+        [[ -z "$lines" ]] || printf '%s\n' "$lines"
         offset=$((offset + 100))
         (( offset < total )) || break
     done
@@ -386,7 +419,7 @@ ask_hours() {
     local h
     while true; do
         h=$(ask "$1" "$2"); h="${h/,/.}"
-        if [[ "$h" =~ ^[0-9]+(\.[0-9]+)?$ ]] && is_gt "$h" 0 && ! is_gt "$h" 24; then echo "$h"; return 0; fi
+        if valid_hours "$h"; then echo "$h"; return 0; fi
         warn "Número de horas no válido: $h" >&2
     done
 }
@@ -396,7 +429,7 @@ valid_month() { [[ "$1" =~ ^[0-9]{4}-(0[1-9]|1[0-2])$ ]]; }
 ask_month() { # ask_month [AAAA-MM] -> fija MONTH YEAR MON LAST_DAY (por defecto el mes de trabajo), sin preguntar
     MONTH="${1:-$WORK_MONTH}"
     YEAR="${MONTH%-*}"; MON="${MONTH#*-}"
-    LAST_DAY=$((10#$(date -d "$MONTH-01 +1 month -1 day" +%d)))
+    LAST_DAY=$((10#$(ddate -d "$MONTH-01 +1 month -1 day" +%d)))
     if [[ -z "${1:-}" ]]; then
         info "Mes: ${C_BOLD}$MONTH${C_RESET} ${C_DIM}(cámbialo con ←/→ en el menú)${C_RESET}"
     fi
@@ -456,7 +489,8 @@ cal_download() { # cal_download año fichero_destino -> 0 ok, 2 la API no tiene 
     mkdir -p "$CAL_DIR"
     tmp=$(mktemp "$CAL_DIR/.descarga.XXXXXX")
     TMP_FILES+=("$tmp")
-    code=$(curl -sS --max-time 20 -o "$tmp" -w '%{http_code}' "$CAL_API/$(cal_holidays_path "$1")" 2>/dev/null || echo 000)
+    code=$(curl -sS --max-time 20 -o "$tmp" -w '%{http_code}' "$CAL_API/$(cal_holidays_path "$1")" 2>/dev/null) || true
+    code=${code:-000}
     if [[ "$code" == "200" ]] && jq -e '.holidays' "$tmp" >/dev/null 2>&1; then mv "$tmp" "$2"; return 0; fi
     rm -f "$tmp"
     [[ "$code" == "404" ]] && return 2
@@ -468,6 +502,16 @@ cal_holidays_json() { # cal_holidays_json año -> JSON de festivos desde la copi
     file=$(cal_holidays_file "$1")
     if [[ ! -s "$file" ]]; then cal_download "$1" "$file" || return 1; fi
     cat "$file"
+}
+
+cal_warn_stale() { # cal_warn_stale año: avisa (una vez por sesión y solo si se ve) si la copia local puede estar desfasada
+    # Llamar directamente, no dentro de $(...), para que se recuerde el aviso.
+    local file
+    file=$(cal_holidays_file "$1")
+    (( $1 >= $(date +%Y) )) && [[ -t 2 && -z "${CAL_STALE_WARNED[$1]:-}" && -s "$file" ]] || return 0
+    [[ -n "$(find "$file" -mtime +"$CAL_LOCAL_MAX_DAYS" 2>/dev/null)" ]] || return 0
+    CAL_STALE_WARNED[$1]=1
+    warn "La copia local de festivos de $1 es del $(cal_local_date "$1") (más de $CAL_LOCAL_MAX_DAYS días): actualízala con $SCRIPT_NAME -u o la tecla u en «Ver festivos»" >&2
 }
 
 cal_holiday_lines() { # stdin JSON de festivos, $1 prefijo de fecha (AAAA o AAAA-MM) -> "fecha|nombre|ámbito"
@@ -488,6 +532,12 @@ cal_local_date() { # fecha de la última descarga de un año ("" si no hay copia
     file=$(cal_holidays_file "$1")
     [[ -s "$file" ]] && date -r "$file" +%d/%m/%Y
     return 0
+}
+
+cal_source_line() { # cal_source_line año -> pie con la atribución (obligatoria) y la fecha de la copia local
+    local fecha
+    fecha=$(cal_local_date "$1")
+    echo "   ${C_DIM}Fuente: calendariosnacionales.com (copia local de $1${fecha:+ descargada el $fecha}) · propios: $(basename "$HOLIDAYS_FILE")${C_RESET}"
 }
 
 cal_update() { # cal_update [años…] -> descarga de nuevo y enseña qué ha cambiado (por defecto: este año y el siguiente)
@@ -634,6 +684,7 @@ load_holidays() { # load_holidays año mes -> HOLIDAY[DD]=descripción, HOLIDAY_
         if [[ -n "$CAL_MUN" ]] && ! jq -e '(.holidays.local // []) | length > 0' <<<"$json" >/dev/null 2>&1; then
             HOLIDAYS_NO_LOCAL=1
         fi
+        cal_warn_stale "$1"
     else
         rc=1
     fi
@@ -654,21 +705,24 @@ load_holidays() { # load_holidays año mes -> HOLIDAY[DD]=descripción, HOLIDAY_
 print_holidays() {
     local d
     for d in $(printf '%s\n' "${!HOLIDAY[@]}" | sort); do
-        echo "     $MONTH-$d ${DOW_NAMES[$(( $(date -d "$MONTH-$d" +%u) - 1 ))]}  $(pad "${HOLIDAY[$d]}" 48) ${C_DIM}${HOLIDAY_SRC[$d]:-}${C_RESET}"
+        echo "     $MONTH-$d ${DOW_NAMES[$(( $(ddate -d "$MONTH-$d" +%u) - 1 ))]}  $(pad "${HOLIDAY[$d]}" 48) ${C_DIM}${HOLIDAY_SRC[$d]:-}${C_RESET}"
     done
 }
 
 # ---------------------------------------------------------------- imputar
+# Aritmética de fechas civiles (AAAA-MM-DD) en UTC: sin cambios de hora, la medianoche siempre existe
+ddate() { TZ=UTC date "$@"; }
+
 short_date() { # 2026-10-26 -> "lun 26/10"
-    echo "${DOW_NAMES[$(( $(date -d "$1" +%u) - 1 ))]} $(date -d "$1" +%d/%m)"
+    echo "${DOW_NAMES[$(( $(ddate -d "$1" +%u) - 1 ))]} $(ddate -d "$1" +%d/%m)"
 }
 
 date_list() { # date_list desde hasta -> una fecha por línea
     local d="$1"
-    while [[ ! "$d" > "$2" ]]; do echo "$d"; d=$(date -d "$d +1 day" +%F); done
+    while [[ ! "$d" > "$2" ]]; do echo "$d"; d=$(ddate -d "$d +1 day" +%F); done
 }
 
-week_start() { date -d "$1 -$(( $(date -d "$1" +%u) - 1 )) days" +%F; } # lunes de la semana de una fecha
+week_start() { ddate -d "$1 -$(( $(ddate -d "$1" +%u) - 1 )) days" +%F; } # lunes de la semana de una fecha
 
 parse_date() { # acepta 15, 15/10, 15/10/2026, 2026-10-15, hoy, ayer -> AAAA-MM-DD
     local v="${1,,}" y="${WORK_MONTH%-*}" m="${WORK_MONTH#*-}" out
@@ -685,7 +739,7 @@ parse_date() { # acepta 15, 15/10, 15/10/2026, 2026-10-15, hoy, ayer -> AAAA-MM-
     else
         return 1
     fi
-    [[ "$(date -d "$out" +%F 2>/dev/null)" == "$out" ]] || return 1
+    [[ "$(ddate -d "$out" +%F 2>/dev/null)" == "$out" ]] || return 1
     echo "$out"
 }
 
@@ -698,8 +752,8 @@ choose_period() { # choose_period [mes|semana|semana-pasada|hoy] -> fija FROM_DA
         else
             echo "   ¿Qué quieres imputar?"
             menu_item m "Mes completo" "$(month_label "$WORK_MONTH")"
-            menu_item s "Esta semana" "$(short_date "$mon") – $(short_date "$(date -d "$mon +4 days" +%F)")"
-            menu_item p "Semana pasada" "$(short_date "$(date -d "$mon -7 days" +%F)") – $(short_date "$(date -d "$mon -3 days" +%F)")"
+            menu_item s "Esta semana" "$(short_date "$mon") – $(short_date "$(ddate -d "$mon +4 days" +%F)")"
+            menu_item p "Semana pasada" "$(short_date "$(ddate -d "$mon -7 days" +%F)") – $(short_date "$(ddate -d "$mon -3 days" +%F)")"
             menu_item d "Hoy" "$(short_date "$today")"
             menu_item o "Otro día"
             menu_item r "Rango de días del mes" "$(month_label "$WORK_MONTH")"
@@ -723,10 +777,10 @@ choose_period() { # choose_period [mes|semana|semana-pasada|hoy] -> fija FROM_DA
             FROM_DATE="$MONTH-01"; TO_DATE=$(printf '%s-%02d' "$MONTH" "$LAST_DAY")
             PERIOD_LABEL="$(month_label "$MONTH")" ;;
         semana)
-            FROM_DATE="$mon"; TO_DATE=$(date -d "$mon +6 days" +%F)
+            FROM_DATE="$mon"; TO_DATE=$(ddate -d "$mon +6 days" +%F)
             PERIOD_LABEL="semana del $(short_date "$FROM_DATE")" ;;
         semana-pasada)
-            FROM_DATE=$(date -d "$mon -7 days" +%F); TO_DATE=$(date -d "$mon -1 day" +%F)
+            FROM_DATE=$(ddate -d "$mon -7 days" +%F); TO_DATE=$(ddate -d "$mon -1 day" +%F)
             PERIOD_LABEL="semana del $(short_date "$FROM_DATE")" ;;
         hoy)
             FROM_DATE="$today"; TO_DATE="$today"; PERIOD="dia"
@@ -738,7 +792,7 @@ choose_period() { # choose_period [mes|semana|semana-pasada|hoy] -> fija FROM_DA
                 if FROM_DATE=$(parse_date "$d"); then break; fi
                 warn "Fecha no válida: $d"
             done
-            TO_DATE="$FROM_DATE"; PERIOD_LABEL="$(short_date "$FROM_DATE") $(date -d "$FROM_DATE" +%Y)" ;;
+            TO_DATE="$FROM_DATE"; PERIOD_LABEL="$(short_date "$FROM_DATE") $(ddate -d "$FROM_DATE" +%Y)" ;;
         rango)
             ask_month; ask_range
             PERIOD_LABEL="$(short_date "$FROM_DATE") – $(short_date "$TO_DATE")" ;;
@@ -748,17 +802,19 @@ choose_period() { # choose_period [mes|semana|semana-pasada|hoy] -> fija FROM_DA
 }
 
 load_holidays_range() { # load_holidays_range desde hasta -> RANGE_HOL[fecha]="descripción"; 1 si falla alguna consulta
-    local m end_m d rc=0
+    local m end_m d rc=0 no_local=0
     RANGE_HOL=()
     m="${1:0:7}"; end_m="${2:0:7}"
     while :; do
         load_holidays "${m%-*}" "${m#*-}" || rc=1
+        (( HOLIDAYS_NO_LOCAL )) && no_local=1
         for d in "${!HOLIDAY[@]}"; do
             if [[ ! "$m-$d" < "$1" && ! "$m-$d" > "$2" ]]; then RANGE_HOL["$m-$d"]="${HOLIDAY[$d]}"; fi
         done
         [[ "$m" == "$end_m" ]] && break
-        m=$(date -d "$m-01 +1 month" +%Y-%m)
+        m=$(ddate -d "$m-01 +1 month" +%Y-%m)
     done
+    HOLIDAYS_NO_LOCAL=$no_local
     return $rc
 }
 
@@ -789,6 +845,11 @@ cmd_imputar() { # cmd_imputar dry_run(0|1) [mes|semana|semana-pasada|hoy]
 
     title "Periodo"
     choose_period "${2:-}" || { warn "Cancelado"; return 0; }
+    if (( AUTO_YES )) && [[ "$TO_DATE" > "$(date +%F)" ]]; then
+        if [[ "$FROM_DATE" > "$(date +%F)" ]]; then warn "Con -y no se imputan días futuros: no hay nada que imputar"; return 0; fi
+        TO_DATE=$(date +%F)
+        info "Con -y no se imputan días futuros: solo hasta hoy ${C_DIM}($FROM_DATE → $TO_DATE)${C_RESET}"
+    fi
     mapfile -t RANGE_DATES < <(date_list "$FROM_DATE" "$TO_DATE")
 
     title "Tarea"
@@ -823,7 +884,7 @@ cmd_imputar() { # cmd_imputar dry_run(0|1) [mes|semana|semana-pasada|hoy]
         [[ -n "$task_act" && "$task_act" != "$TASK_ACTIVITY" ]] && CHANGES+=("actividad tarea")
         [[ -n "$vac_id" && "$vac_id" != "$VAC_ID" ]] && CHANGES+=("vacaciones #$vac_id")
         [[ -n "$vac_act" && "$vac_act" != "$VAC_ACTIVITY" ]] && CHANGES+=("actividad vacaciones")
-        if (( ${#CHANGES[@]} )) && confirm "¿Guardar como predeterminado: $(IFS=,; echo "${CHANGES[*]}")?"; then
+        if (( ${#CHANGES[@]} && ! dry )) && confirm "¿Guardar como predeterminado: $(IFS=,; echo "${CHANGES[*]}")?"; then
             TASK_ID="$task_id"
             [[ "$PERIOD" != "dia" ]] && HOURS="$task_hours"
             [[ -n "$task_act" ]] && TASK_ACTIVITY="$task_act"
@@ -834,8 +895,16 @@ cmd_imputar() { # cmd_imputar dry_run(0|1) [mes|semana|semana-pasada|hoy]
     fi
 
     title "Festivos"
-    load_holidays_range "$FROM_DATE" "$TO_DATE" || warn "No se pudieron consultar los festivos oficiales; indícalos a mano"
-    if (( HOLIDAYS_NO_LOCAL )); then warn "Aún no hay festivos locales publicados para $CAL_LABEL en ese año; revisa si falta alguno"; fi
+    # Con -y nadie revisa los festivos: si no son fiables se aborta (la imputación rápida del menú sí se confirma)
+    local strict=$(( AUTO_YES && ! QUICK_CONFIRM ))
+    if ! load_holidays_range "$FROM_DATE" "$TO_DATE"; then
+        if (( strict )); then warn "No se pudieron consultar los festivos oficiales: con -y no se imputa (ejecuta sin -y para indicarlos a mano)"; return 1; fi
+        warn "No se pudieron consultar los festivos oficiales; indícalos a mano"
+    fi
+    if (( HOLIDAYS_NO_LOCAL )); then
+        if (( strict )); then warn "Aún no hay festivos locales publicados para $CAL_LABEL en ese año: con -y no se imputa (ejecuta sin -y para revisarlos)"; return 1; fi
+        warn "Aún no hay festivos locales publicados para $CAL_LABEL en ese año; revisa si falta alguno"
+    fi
     if [[ "$PERIOD" == "dia" ]]; then
         if [[ -n "${RANGE_HOL[$FROM_DATE]:-}" ]]; then
             warn "$(short_date "$FROM_DATE") es festivo: ${RANGE_HOL[$FROM_DATE]}"
@@ -870,7 +939,7 @@ cmd_imputar() { # cmd_imputar dry_run(0|1) [mes|semana|semana-pasada|hoy]
 
     title "Plan de imputación — $PERIOD_LABEL"
     for dt in "${RANGE_DATES[@]}"; do
-        dow=$(date -d "$dt" +%u)
+        dow=$(ddate -d "$dt" +%u)
         label="$dt ${DOW_NAMES[$((dow - 1))]}"
         if (( dow >= 6 )); then
             weekends=$((weekends + 1)); echo "  ${C_DIM}$label  fin de semana${C_RESET}"; continue
@@ -926,7 +995,8 @@ cmd_imputar() { # cmd_imputar dry_run(0|1) [mes|semana|semana-pasada|hoy]
             --arg act "${PLAN_ACTS[$i]}" \
             '{time_entry: ({issue_id: $issue, spent_on: $date, hours: $hours, comments: $comments}
                 + (if $act == "" then {} else {activity_id: ($act | tonumber)} end))}')
-        code=$(api_post "/time_entries.json" "$payload" || echo "000")
+        code=$(api_send POST "/time_entries.json" "$payload") || true
+        code=${code:-000}
         if [[ "$code" == "201" ]]; then
             ok "${C_DIM}$idx${C_RESET} ${PLAN_DATES[$i]}  ${PLAN_HOURS[$i]}h → #${PLAN_ISSUES[$i]}"
             if [[ "${PLAN_KINDS[$i]}" == "vacaciones" ]]; then
@@ -935,7 +1005,7 @@ cmd_imputar() { # cmd_imputar dry_run(0|1) [mes|semana|semana-pasada|hoy]
                 ok_task_days=$((ok_task_days + 1)); ok_task_hours=$(calc "$ok_task_hours + ${PLAN_HOURS[$i]}")
             fi
         else
-            err=$(jq -r '(.errors // []) | join(", ")' "$TMP_RESP" 2>/dev/null || true)
+            err=$(api_errors)
             echo "${C_RED}✖ $idx ${PLAN_DATES[$i]}  HTTP $code ${err}${C_RESET}"
             FAILED+=("${PLAN_DATES[$i]} (HTTP $code${err:+: $err})")
         fi
@@ -985,7 +1055,7 @@ print_totals_by_issue() { # print_totals_by_issue desde hasta [imputaciones ya l
 
 # ---------------------------------------------------------------- gestionar / borrar imputaciones
 cmd_gestionar() { # lista las imputaciones del mes de trabajo y permite borrarlas o editarlas
-    local dt issue h entry_id rest act comm i n sel_raw code err new_issue new_hours new_act new_comm payload
+    local dt issue h entry_id rest act comm i n sel_raw code err new_issue new_hours new_comm payload
     local -a entries=() sel_nums=()
     ensure_api || return 1
 
@@ -1014,10 +1084,10 @@ cmd_gestionar() { # lista las imputaciones del mes de trabajo y permite borrarla
             ui_hr
             for i in "${!entries[@]}"; do
                 IFS='|' read -r dt issue h entry_id act comm <<<"${entries[$i]}"
-                local dow_str="${DOW_NAMES[$(( $(date -d "$dt" +%u) - 1 ))]}"
-                local is_vac=0 col="$C_RESET" tag="#$issue"
+                local dow_str="${DOW_NAMES[$(( $(ddate -d "$dt" +%u) - 1 ))]}"
+                local col="$C_RESET" tag="#$issue"
                 if [[ -n "$VAC_ID" && "$issue" == "$VAC_ID" ]]; then
-                    is_vac=1; col="$C_BLUE"; tag="#$issue (vacaciones)"
+                    col="$C_BLUE"; tag="#$issue (vacaciones)"
                 elif [[ "$issue" != "-" ]] && fetch_issue "$issue" 2>/dev/null; then
                     tag="#$issue ${ISSUE_SUBJECT[$issue]}"
                 fi
@@ -1059,11 +1129,12 @@ cmd_gestionar() { # lista las imputaciones del mes de trabajo y permite borrarla
                 if confirm_no "¿Confirmas el borrado definitivo?"; then
                     for n in "${sel_nums[@]}"; do
                         IFS='|' read -r dt issue h entry_id act comm <<<"${entries[$((n - 1))]}"
-                        code=$(api_delete "/time_entries/$entry_id.json" || echo "000")
+                        code=$(api_send DELETE "/time_entries/$entry_id.json") || true
+                        code=${code:-000}
                         if [[ "$code" == "204" || "$code" == "200" ]]; then
                             ok "Borrada imputación de $dt (${h}h → #$issue)"
                         else
-                            err=$(jq -r '(.errors // []) | join(", ")' "$TMP_RESP" 2>/dev/null || true)
+                            err=$(api_errors)
                             warn "Error al borrar $dt [id:$entry_id]: HTTP $code ${err}"
                         fi
                     done
@@ -1080,19 +1151,25 @@ cmd_gestionar() { # lista las imputaciones del mes de trabajo y permite borrarla
                 fi
                 IFS='|' read -r dt issue h entry_id act comm <<<"${entries[$((n - 1))]}"
                 echo "   Editando imputación del ${C_BOLD}$dt${C_RESET} [id:$entry_id]"
-                new_issue=$(ask_issue "Tarea" "$issue")
+                if [[ "$issue" == "-" ]]; then   # imputación sin tarea (solo proyecto): vacío = dejarla así
+                    new_issue=$(ask_issue "Tarea (vacío = seguir sin tarea)" "" 1)
+                else
+                    new_issue=$(ask_issue "Tarea" "$issue")
+                fi
                 new_hours=$(ask_hours "Horas" "$h")
                 new_comm=$(ask "Comentario ('-' = vaciar)" "${comm:--}")
                 [[ "$new_comm" == "-" ]] && new_comm=""
                 payload=$(jq -n \
-                    --argjson issue "$new_issue" --argjson hours "$new_hours" --arg comments "$new_comm" \
-                    '{time_entry: {issue_id: $issue, hours: $hours, comments: $comments}}')
-                code=$(api_put "/time_entries/$entry_id.json" "$payload" || echo "000")
+                    --arg issue "$new_issue" --argjson hours "$new_hours" --arg comments "$new_comm" \
+                    '{time_entry: ({hours: $hours, comments: $comments}
+                        + (if $issue == "" then {} else {issue_id: ($issue | tonumber)} end))}')
+                code=$(api_send PUT "/time_entries/$entry_id.json" "$payload") || true
+                code=${code:-000}
                 if [[ "$code" == "204" || "$code" == "200" ]]; then
-                    ok "Imputación actualizada ($dt: ${new_hours}h → #$new_issue)"
+                    ok "Imputación actualizada ($dt: ${new_hours}h → ${new_issue:+#}${new_issue:-sin tarea})"
                     STATUS_CACHE=()
                 else
-                    err=$(jq -r '(.errors // []) | join(", ")' "$TMP_RESP" 2>/dev/null || true)
+                    err=$(api_errors)
                     warn "No se pudo actualizar: HTTP $code ${err}"
                 fi
                 pause
@@ -1144,7 +1221,7 @@ analyze_month() { # analyze_month AAAA-MM -> rellena las variables M_* sin impri
 
     for ((day = 1; day <= LAST_DAY; day++)); do
         dd=$(printf '%02d' "$day"); dt="$MONTH-$dd"
-        dow=$(date -d "$dt" +%u)
+        dow=$(ddate -d "$dt" +%u)
         label="$dt ${DOW_NAMES[$((dow - 1))]}"
         hrs="${per_day[$dt]:-0}"
         M_IMPUTED=$(calc "$M_IMPUTED + $hrs")
@@ -1201,7 +1278,7 @@ analyze_month() { # analyze_month AAAA-MM -> rellena las variables M_* sin impri
 
 print_month_calendar() { # pinta la cuadrícula visual del mes analizado
     local day dd dow first_dow col=0 cell
-    first_dow=$(date -d "$MONTH-01" +%u)
+    first_dow=$(ddate -d "$MONTH-01" +%u)
     echo "   ${C_BOLD} lu   ma   mi   ju   vi   ${C_DIM}sá   do${C_RESET}"
     printf '   '
     for ((col = 1; col < first_dow; col++)); do printf '     '; done
@@ -1318,7 +1395,7 @@ cmd_festivos_year() { # cmd_festivos_year [AAAA] -> todos los festivos del año,
         print_holidays
         for d in "${!HOLIDAY[@]}"; do
             total=$((total + 1))
-            dow=$(date -d "$MONTH-$d" +%u)
+            dow=$(ddate -d "$MONTH-$d" +%u)
             (( dow < 6 )) && weekday=$((weekday + 1))
         done
     done
@@ -1329,26 +1406,11 @@ cmd_festivos_year() { # cmd_festivos_year [AAAA] -> todos los festivos del año,
         info "$total festivos · ${C_BOLD}$weekday entre semana${C_RESET} (no se imputan) · $((total - weekday)) en sábado o domingo"
     fi
     (( no_local )) && warn "Aún no hay festivos locales de $year publicados para $CAL_LABEL; pulsa u más adelante para actualizar"
-    echo "   ${C_DIM}Fuente: calendariosnacionales.com (copia local$( [[ -n "$(cal_local_date "$year")" ]] && echo " descargada el $(cal_local_date "$year")")) · propios: $(basename "$HOLIDAYS_FILE")${C_RESET}"
+    cal_source_line "$year"
     return 0
 }
 
-browse_years() { # festivos del año del mes de trabajo, moviéndose de año en año
-    while true; do
-        clear_screen
-        cmd_festivos_year "${WORK_MONTH%-*}" || true
-        [[ -t 0 ]] || return 0
-        echo
-        read_key "${C_DIM}←/a año anterior · →/s año siguiente · h año actual · u actualizar desde la API · Intro volver${C_RESET}"
-        case "$KEY" in
-            left|a|A)  month_shift -12 ;;
-            right|s|S) month_shift +12 ;;
-            h|H)       WORK_MONTH=$(date +%Y-%m) ;;
-            u|U)       cal_update "${WORK_MONTH%-*}"; pause ;;
-            *)         return 0 ;;
-        esac
-    done
-}
+browse_years() { browse_months cmd_festivos_year 12; } # festivos del año del mes de trabajo, de año en año
 
 cmd_festivos() {
     local rc=0
@@ -1361,7 +1423,7 @@ cmd_festivos() {
     (( HOLIDAYS_NO_LOCAL )) && warn "Aún no hay festivos locales de $YEAR publicados para $CAL_LABEL; si los conoces, añádelos como propios"
     if (( ${#HOLIDAY[@]} )); then print_holidays; else info "No hay festivos este mes"; fi
     echo
-    echo "   ${C_DIM}Fuente: calendariosnacionales.com (copia local${YEAR:+ de $YEAR}$( [[ -n "$(cal_local_date "$YEAR")" ]] && echo " descargada el $(cal_local_date "$YEAR")")) · propios: $(basename "$HOLIDAYS_FILE")${C_RESET}"
+    cal_source_line "$YEAR"
     return 0
 }
 
@@ -1738,7 +1800,7 @@ month_label() { # 2026-10 -> octubre 2026
     echo "${names[$((10#${1#*-} - 1))]} ${1%-*}"
 }
 
-month_shift() { WORK_MONTH=$(date -d "$WORK_MONTH-01 $1 month" +%Y-%m); }
+month_shift() { WORK_MONTH=$(ddate -d "$WORK_MONTH-01 $1 month" +%Y-%m); }
 
 issue_text() { # issue_text id título -> "#id título" o "(sin definir)"
     if [[ -z "$1" ]]; then echo "(sin definir)"; else echo "#$1${2:+ $2}"; fi
@@ -1752,22 +1814,22 @@ refresh_labels() { # títulos de las tareas configuradas, para los menús (usa l
     return 0
 }
 
-browse_months() { # browse_months comando: muestra el mes de trabajo y permite moverse entre meses
+browse_months() { # browse_months comando [paso]: muestra el mes de trabajo (paso 12: su año) y permite moverse
+    local cmd="$1" step="${2:-1}" unit="mes" arg extra="b borrar/editar"
+    (( step == 12 )) && unit="año"
+    [[ "$cmd" == cmd_festivos* ]] && extra="u actualizar desde la API"
     while true; do
         clear_screen
-        "$1" "$WORK_MONTH" || true
+        if (( step == 12 )); then arg="${WORK_MONTH%-*}"; else arg="$WORK_MONTH"; fi
+        "$cmd" "$arg" || true
         [[ -t 0 ]] || return 0
         echo
-        if [[ "$1" == "cmd_festivos" ]]; then
-            read_key "${C_DIM}←/a mes anterior · →/s mes siguiente · h mes actual · u actualizar desde la API · Intro volver${C_RESET}"
-        else
-            read_key "${C_DIM}←/a mes anterior · →/s mes siguiente · h mes actual · b borrar/editar · Intro volver${C_RESET}"
-        fi
+        read_key "${C_DIM}←/a $unit anterior · →/s $unit siguiente · h $unit actual · $extra · Intro volver${C_RESET}"
         case "$KEY" in
-            u|U) if [[ "$1" == "cmd_festivos" ]]; then cal_update "${WORK_MONTH%-*}"; pause; else return 0; fi ;;
-            b|B) if [[ "$1" == "cmd_resumen" ]]; then cmd_gestionar || true; else return 0; fi ;;
-            left|a|A)  month_shift -1 ;;
-            right|s|S) month_shift +1 ;;
+            u|U) if [[ "$cmd" == cmd_festivos* ]]; then cal_update "${WORK_MONTH%-*}"; pause; else return 0; fi ;;
+            b|B) if [[ "$cmd" == "cmd_resumen" ]]; then cmd_gestionar || true; else return 0; fi ;;
+            left|a|A)  month_shift "-$step" ;;
+            right|s|S) month_shift "+$step" ;;
             h|H)       WORK_MONTH=$(date +%Y-%m) ;;
             *)         return 0 ;;
         esac
