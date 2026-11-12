@@ -52,9 +52,10 @@ Este documento incluye tanto la **guía de instalación y uso** como la **docume
 | GNU `date` | Aritmética de fechas (`date -d "… +1 month"`, `date -r fichero`). En macOS no funciona sin `gdate`. |
 | `curl` | Llamadas HTTP. |
 | `jq` | Todo el JSON. |
+| `flock` (util-linux) | Bloqueo para que dos ejecuciones no escriban en Redmine a la vez. |
 | `awk`, `sed`, `sort`, `paste`, `iconv`, `find` | Utilidades estándar. `iconv` quita tildes en el buscador de localidades. |
 
-El script comprueba `curl`, `jq` y GNU `date` al arrancar.
+El script comprueba `curl`, `jq`, `flock` y GNU `date` al arrancar.
 
 Se necesita acceso a la red o a la VPN si la instancia de Redmine lo exige. Para los festivos solo hace falta internet en la primera descarga o al actualizar.
 
@@ -116,11 +117,12 @@ redmine/
 ├── imputar-redmine.sh           # el script
 ├── imputar-redmine.conf         # configuración del usuario (CLAVE=valor). Contiene la API key → permisos 600
 ├── imputar-redmine.conf.example # plantilla de configuración sin datos sensibles
-├── .gitignore                   # ignora imputar-redmine.conf, festivos.json, calendario/ y .cache/
+├── .gitignore                   # ignora imputar-redmine.conf, festivos.json, calendario/, .cache/ y .imputar.lock
 ├── festivos.json                # festivos propios (se suman a los oficiales o los anulan). Puede ser []
 ├── calendario/                  # copia local de festivos oficiales, 1 fichero por año y localidad
 │   └── 2026-and-granada-granada.json
 ├── .cache/                      # listados de comunidades/provincias/localidades (caché de 7 días)
+├── .imputar.lock                # bloqueo (flock) mientras se escribe en Redmine; se puede quedar, no molesta
 └── README.md
 ```
 
@@ -132,6 +134,7 @@ Rutas que se pueden cambiar con variables de entorno:
 | `REDMINE_URL` | (vacío) | URL base de Redmine. Si está definida, **tiene prioridad** sobre la del `.conf`. |
 | `REDMINE_CONFIG` | `$SCRIPT_DIR/imputar-redmine.conf` | Fichero de configuración. **Úsala en las pruebas** para no tocar el real. |
 | `REDMINE_HOLIDAYS` | `$SCRIPT_DIR/festivos.json` | Festivos propios. |
+| `REDMINE_LOCK` | `$SCRIPT_DIR/.imputar.lock` | Fichero de bloqueo entre ejecuciones. |
 
 `calendario/` y `.cache/` se pueden borrar sin problema: se regeneran solos.
 
@@ -356,7 +359,8 @@ Convenciones del código:
 8. **Entrada por stdin en funciones que preguntan**: no pases listas por tubería a una función que luego hace `ask`, porque se comería las respuestas. `pick_option` recibe la lista **como argumento** por eso.
 9. **Sin terminal** (stdin no es una terminal, como en pruebas con tubería): `read_key` devuelve `eof` al acabarse la entrada y los menús lo tratan como «salir/volver». `browse_months` y `browse_years` no entran en bucle si stdin no es una terminal.
 10. **El ámbito `scope` de la API no es fiable**: ver la sección de calendariosnacionales.
-11. **Sin terminal, las preguntas aceptan el valor por defecto.** Al agotarse la entrada (stdin vacío o redirigido, p. ej. en cron), `read` falla y la respuesta queda vacía: `ask` devuelve el valor por defecto, `confirm` (incluido el «¿Imputar?» final) responde **sí** y `confirm_no` responde **no**. Como los `cmd_*` se llaman en contexto `||`, `set -e` no lo corta. Consecuencia: `./imputar-redmine.sh -d` o `-s` **sin `-y`** y sin terminal imputa igual que con `-y`, pero **sin** sus salvaguardas (no aborta si los festivos no se pudieron cargar o faltan los locales). Para ejecuciones desatendidas usa siempre `-y`. `read_key` (menús y selector de periodo) sí devuelve `eof` y cancela.
+11. **Sin terminal nunca se responde por defecto.** `-i`, `-s` y `-d` sin terminal (stdin no es una terminal, p. ej. en cron) **solo se ejecutan con `-y`**; si no, terminan con error antes de consultar nada. `-b` (gestionar) siempre necesita terminal. Si la entrada se cierra a mitad de una pregunta (EOF: tubería vacía, Ctrl+D), `ask`, `confirm`, `confirm_no` y el «¿Imputar?» de la imputación rápida llaman a `input_closed`, que **aborta el script entero sin escribir nada** (código 143): como `ask` suele correr dentro de `$(…)` anidados, `exit` no bastaría y termina también las subshells intermedias. `-n` (simulación) sí se puede ejecutar sin terminal. `read_key` (menús y selector de periodo) sigue devolviendo `eof` y cancela.
+12. **Bloqueo y segunda lectura antes de escribir.** Tras confirmar el plan, `cmd_imputar` toma un bloqueo exclusivo con `flock` sobre `.imputar.lock` (`lock_writes`; no espera: si otra ejecución lo tiene, avisa y sale con error sin escribir) y **vuelve a leer** lo imputado en el periodo. Para cada día recalcula lo pendiente: si mientras tanto se imputaron horas (otra ejecución, la web de Redmine…) se salta el día o se ajustan las horas, con aviso. El bloqueo se suelta al terminar de escribir (`unlock_writes`), también en `-b` alrededor de cada borrado o edición, para no bloquear un cron mientras el menú sigue abierto.
 
 ---
 

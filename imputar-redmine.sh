@@ -15,6 +15,8 @@ CAL_DIR="$SCRIPT_DIR/calendario"   # copia local de los festivos descargados (se
 CACHE_DIR="$SCRIPT_DIR/.cache"     # listados de comunidades/provincias/localidades
 CAL_CACHE_DAYS=7
 CAL_LOCAL_MAX_DAYS=30              # a partir de aquí se avisa de que la copia local de festivos puede estar desfasada
+LOCK_FILE="${REDMINE_LOCK:-$SCRIPT_DIR/.imputar.lock}"   # evita que dos ejecuciones escriban en Redmine a la vez
+LOCK_HELD=0
 
 C_RESET=$'\e[0m'; C_BOLD=$'\e[1m'; C_RED=$'\e[31m'; C_GREEN=$'\e[32m'
 C_YELLOW=$'\e[33m'; C_BLUE=$'\e[34m'; C_CYAN=$'\e[36m'; C_DIM=$'\e[2m'
@@ -117,17 +119,37 @@ progress_bar() { # progress_bar imputado esperado [ancho] [color_forzado]
     printf '%s[%s%s%s%s]%s %3d%%' "$col" "$bar_f" "$C_DIM" "$bar_e" "$col" "$C_RESET" "$pct"
 }
 
+# Si la entrada se cierra (EOF: sin terminal, Ctrl+D, tubería vacía) nunca se toma la respuesta por defecto:
+# se aborta el script entero. ask suele ejecutarse dentro de $(…) anidados, donde exit solo terminaría esa
+# subshell y el llamador seguiría con un valor vacío (o en bucle): se terminan todas las subshells hasta el
+# proceso principal, cuyo trap de TERM sale (y limpia los temporales).
+input_closed() {
+    local pid="$BASHPID" ppid
+    local -a chain=()
+    echo >&2
+    echo "${C_RED}✖ Entrada cerrada (EOF): se cancela sin escribir nada en Redmine${C_RESET}" >&2
+    while [[ "$pid" != "$$" ]]; do
+        chain+=("$pid")
+        ppid=$(awk '/^PPid:/ { print $2 }' "/proc/$pid/status" 2>/dev/null) || break
+        [[ -n "$ppid" && "$ppid" != "$pid" && "$ppid" -gt 1 ]] || break
+        pid="$ppid"
+    done
+    kill -s TERM "$$" 2>/dev/null || true
+    (( ${#chain[@]} )) && kill -s TERM "${chain[@]}" 2>/dev/null
+    exit 1
+}
+
 ask() { # ask "pregunta" [defecto]
     local ans
-    if [[ -n "${2:-}" ]]; then read -r -p "$1 [$2]: " ans; else read -r -p "$1: " ans; fi
+    if [[ -n "${2:-}" ]]; then read -r -p "$1 [$2]: " ans || input_closed; else read -r -p "$1: " ans || input_closed; fi
     echo "${ans:-${2:-}}"
 }
 
 confirm() {
     (( AUTO_YES )) && return 0
-    local a; read -r -p "$1 [S/n]: " a; [[ ! "$a" =~ ^[nN] ]]
+    local a; read -r -p "$1 [S/n]: " a || input_closed; [[ ! "$a" =~ ^[nN] ]]
 }
-confirm_no() { local a; read -r -p "$1 [s/N]: " a; [[ "$a" =~ ^[sSyY] ]]; }
+confirm_no() { local a; read -r -p "$1 [s/N]: " a || input_closed; [[ "$a" =~ ^[sSyY] ]]; }
 pause() { read -r -p "${C_DIM}Pulsa Intro para continuar…${C_RESET}" _; }
 
 calc() { # calc "expr" -> resultado; solo números, + - * (la expresión va por -v, nunca como código awk)
@@ -213,6 +235,27 @@ api_send() { # api_send METODO ruta [json] -> código HTTP (cuerpo de la respues
 
 api_errors() { # mensajes de error de la última respuesta de Redmine ($TMP_RESP), separados por comas
     jq -r '(.errors // []) | join(", ")' "$TMP_RESP" 2>/dev/null || true
+}
+
+lock_writes() { # bloqueo exclusivo (no espera) antes de escribir en Redmine; 1 si otra ejecución lo tiene
+    (( LOCK_HELD )) && return 0
+    if ! { exec 9>"$LOCK_FILE"; } 2>/dev/null; then
+        warn "No se pudo crear el fichero de bloqueo $LOCK_FILE: no se escribe nada en Redmine"
+        return 1
+    fi
+    if ! flock -n 9; then
+        exec 9>&-
+        warn "Ya hay otra ejecución de $SCRIPT_NAME escribiendo en Redmine (bloqueo $LOCK_FILE). Espera a que termine y vuelve a intentarlo; no se ha escrito nada."
+        return 1
+    fi
+    LOCK_HELD=1
+}
+
+unlock_writes() {
+    (( LOCK_HELD )) || return 0
+    flock -u 9 || true
+    exec 9>&-
+    LOCK_HELD=0
 }
 
 ensure_api() { # pide/valida la URL y la API key una vez por sesión
@@ -836,7 +879,7 @@ cmd_imputar() { # cmd_imputar dry_run(0|1) [mes|semana|semana-pasada|hoy]
     local vac_id="" vac_hours vac_act="" vac_comment=""
     local d dt dow label kind issue target act comment existing remaining extra code err payload h f total_plan idx
     local -A VACATION=() EXISTING=()
-    local -a PLAN_DATES=() PLAN_ISSUES=() PLAN_HOURS=() PLAN_ACTS=() PLAN_COMMENTS=() PLAN_KINDS=()
+    local -a PLAN_DATES=() PLAN_ISSUES=() PLAN_HOURS=() PLAN_ACTS=() PLAN_COMMENTS=() PLAN_KINDS=() PLAN_TARGETS=()
     local -a SKIP_HOLIDAYS=() SKIP_DONE=() FAILED=() CHANGES=()
     local weekends=0 ok_task_days=0 ok_task_hours=0 ok_vac_days=0 ok_vac_hours=0
 
@@ -963,7 +1006,7 @@ cmd_imputar() { # cmd_imputar dry_run(0|1) [mes|semana|semana-pasada|hoy]
         fi
 
         PLAN_DATES+=("$dt"); PLAN_ISSUES+=("$issue"); PLAN_HOURS+=("$remaining")
-        PLAN_ACTS+=("$act"); PLAN_COMMENTS+=("$comment"); PLAN_KINDS+=("$kind")
+        PLAN_ACTS+=("$act"); PLAN_COMMENTS+=("$comment"); PLAN_KINDS+=("$kind"); PLAN_TARGETS+=("$target")
         extra=""
         if is_gt "$existing" 0; then extra=" ${C_DIM}(ya había ${existing}h)${C_RESET}"; fi
         if [[ "$kind" == "vacaciones" ]]; then
@@ -979,16 +1022,51 @@ cmd_imputar() { # cmd_imputar dry_run(0|1) [mes|semana|semana-pasada|hoy]
     info "Se van a imputar ${C_BOLD}$(calc "$(IFS=+; echo "${PLAN_HOURS[*]}")")h${C_RESET} en ${#PLAN_DATES[@]} $( (( ${#PLAN_DATES[@]} == 1 )) && echo día || echo días)"
     if (( dry )); then warn "Simulación terminada: no se ha imputado nada"; return 0; fi
     if (( QUICK_CONFIRM )); then
-        local ans; read -r -p "¿Imputar? [S/n]: " ans
+        local ans; read -r -p "¿Imputar? [S/n]: " ans || input_closed
         [[ "$ans" =~ ^[nN] ]] && { warn "Cancelado"; return 0; }
     elif ! confirm "¿Imputar?"; then
         warn "Cancelado"; return 0
     fi
 
-    title "Imputando"
-    total_plan=${#PLAN_DATES[@]}
+    # Bloqueo + segunda lectura: entre el plan y la confirmación pueden haberse imputado horas
+    # (otra ejecución, la web de Redmine…). Se recalcula lo pendiente de cada día con el bloqueo ya tomado.
+    lock_writes || return 1
+    info "Comprobando de nuevo lo ya imputado antes de escribir…"
+    if ! existing_lines=$(fetch_entries "$FROM_DATE" "$TO_DATE"); then
+        warn "No se pudieron releer las imputaciones: no se imputa nada"
+        unlock_writes; return 1
+    fi
+    EXISTING=()
+    while read -r dt _ h _; do
+        [[ -z "$dt" ]] && continue
+        EXISTING[$dt]=$(calc "${EXISTING[$dt]:-0} + $h")
+    done <<<"$existing_lines"
+    local -a keep=()
     for i in "${!PLAN_DATES[@]}"; do
-        idx=$(printf '[%2d/%2d]' "$((i + 1))" "$total_plan")
+        dt="${PLAN_DATES[$i]}"
+        existing="${EXISTING[$dt]:-0}"
+        remaining=$(calc "${PLAN_TARGETS[$i]} - $existing")
+        if ! is_gt "$remaining" 0; then
+            warn "$dt: mientras tanto se imputaron horas (ya hay ${existing}h); se salta"
+            SKIP_DONE+=("$dt"); continue
+        fi
+        if [[ "$remaining" != "${PLAN_HOURS[$i]}" ]]; then
+            warn "$dt: lo imputado cambió mientras tanto (ya hay ${existing}h); se imputan ${remaining}h en vez de ${PLAN_HOURS[$i]}h"
+            PLAN_HOURS[i]="$remaining"
+        fi
+        keep+=("$i")
+    done
+    if (( ${#keep[@]} == 0 )); then
+        ok "No queda nada que imputar"
+        unlock_writes; return 0
+    fi
+
+    title "Imputando"
+    total_plan=${#keep[@]}
+    local n_done=0
+    for i in "${keep[@]}"; do
+        n_done=$((n_done + 1))
+        idx=$(printf '[%2d/%2d]' "$n_done" "$total_plan")
         payload=$(jq -n \
             --argjson issue "${PLAN_ISSUES[$i]}" --arg date "${PLAN_DATES[$i]}" \
             --argjson hours "${PLAN_HOURS[$i]}" --arg comments "${PLAN_COMMENTS[$i]}" \
@@ -1010,6 +1088,7 @@ cmd_imputar() { # cmd_imputar dry_run(0|1) [mes|semana|semana-pasada|hoy]
             FAILED+=("${PLAN_DATES[$i]} (HTTP $code${err:+: $err})")
         fi
     done
+    unlock_writes
 
     title "Resumen $FROM_DATE → $TO_DATE"
     printf '  %-28s %3s días  %6sh\n' "Tarea #$task_id" "$ok_task_days" "$ok_task_hours"
@@ -1127,6 +1206,7 @@ cmd_gestionar() { # lista las imputaciones del mes de trabajo y permite borrarla
                     echo "     #$n → $dt (${h}h en tarea #$issue${comm:+ · $comm}) [id:$entry_id]"
                 done
                 if confirm_no "¿Confirmas el borrado definitivo?"; then
+                    lock_writes || { pause; continue; }
                     for n in "${sel_nums[@]}"; do
                         IFS='|' read -r dt issue h entry_id act comm <<<"${entries[$((n - 1))]}"
                         code=$(api_send DELETE "/time_entries/$entry_id.json") || true
@@ -1138,6 +1218,7 @@ cmd_gestionar() { # lista las imputaciones del mes de trabajo y permite borrarla
                             warn "Error al borrar $dt [id:$entry_id]: HTTP $code ${err}"
                         fi
                     done
+                    unlock_writes
                     STATUS_CACHE=()
                     pause
                 fi
@@ -1163,7 +1244,9 @@ cmd_gestionar() { # lista las imputaciones del mes de trabajo y permite borrarla
                     --arg issue "$new_issue" --argjson hours "$new_hours" --arg comments "$new_comm" \
                     '{time_entry: ({hours: $hours, comments: $comments}
                         + (if $issue == "" then {} else {issue_id: ($issue | tonumber)} end))}')
+                lock_writes || { pause; continue; }
                 code=$(api_send PUT "/time_entries/$entry_id.json" "$payload") || true
+                unlock_writes
                 code=${code:-000}
                 if [[ "$code" == "204" || "$code" == "200" ]]; then
                     ok "Imputación actualizada ($dt: ${new_hours}h → ${new_issue:+#}${new_issue:-sin tarea})"
@@ -1888,6 +1971,7 @@ main_menu() {
 # ---------------------------------------------------------------- arranque
 command -v curl >/dev/null || die "Falta curl"
 command -v jq   >/dev/null || die "Falta jq (sudo apt install jq)"
+command -v flock >/dev/null || die "Falta flock (paquete util-linux)"
 date -d "2000-01-01 +1 day" >/dev/null 2>&1 || die "Se necesita GNU date"
 
 load_config
@@ -1918,6 +2002,15 @@ elif [[ -n "${2:-}" ]]; then
         WORK_MONTH="$2"
     fi
 fi
+
+# Sin terminal (cron, tuberías…) solo se escribe en Redmine con -y: sin él, las preguntas no tendrían respuesta
+# y antes se tomaba el «sí» por defecto saltándose las salvaguardas de -y. Gestionar (-b) siempre es interactivo.
+case "${1:-}" in
+    -i|--imputar|-s|--semana|-d|--hoy)
+        [[ -t 0 ]] || (( AUTO_YES )) || die "Sin terminal no se imputa sin -y (p. ej. $SCRIPT_NAME ${1} -y); no se ha escrito nada." ;;
+    -b|--borrar|--gestionar)
+        [[ -t 0 ]] || die "Gestionar imputaciones (-b) necesita una terminal; no se ha escrito nada." ;;
+esac
 
 case "${1:-}" in
     "")               main_menu ;;

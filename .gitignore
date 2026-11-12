@@ -19,3 +19,6 @@ calendario/
 .vscode/
 
 
+
+# Bloqueo entre ejecuciones (flock)
+.imputar.lock
