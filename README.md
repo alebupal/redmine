@@ -71,20 +71,24 @@ Opciones de línea de comandos:
 
 ```bash
 ./imputar-redmine.sh                     # menú interactivo
-./imputar-redmine.sh -i                  # imputar (pregunta el periodo)
-./imputar-redmine.sh -s                  # imputar esta semana
-./imputar-redmine.sh -d                  # imputar hoy
+./imputar-redmine.sh AAAA-MM             # menú interactivo abierto en ese mes
+./imputar-redmine.sh -i                  # imputar (pregunta el periodo)            · --imputar
+./imputar-redmine.sh -s                  # imputar esta semana                      · --semana
+./imputar-redmine.sh -d                  # imputar hoy                              · --hoy
 ./imputar-redmine.sh -d -y               # imputar hoy directamente sin preguntas
-./imputar-redmine.sh -n [AAAA-MM]        # simular (no imputa nada)
-./imputar-redmine.sh -r [AAAA-MM]        # horas imputadas de un mes (calendario + resumen)
-./imputar-redmine.sh -b [AAAA-MM]        # borrar o editar imputaciones de un mes
-./imputar-redmine.sh -f [AAAA|AAAA-MM]   # festivos del año (o de un mes)
-./imputar-redmine.sh -u                  # actualizar festivos desde la API y ver cambios
-./imputar-redmine.sh -c                  # configuración
-./imputar-redmine.sh -h                  # ayuda
+./imputar-redmine.sh -s -y               # imputar esta semana sin preguntas (nunca días futuros)
+./imputar-redmine.sh -n [AAAA-MM]        # simular (no imputa nada)                 · --simular, --dry-run
+./imputar-redmine.sh -r [AAAA-MM]        # horas imputadas de un mes                · --resumen
+./imputar-redmine.sh -b [AAAA-MM]        # borrar o editar imputaciones de un mes   · --borrar, --gestionar
+./imputar-redmine.sh -f [AAAA|AAAA-MM]   # festivos del año (o de un mes)           · --festivos
+./imputar-redmine.sh -u                  # actualizar festivos desde la API         · --actualizar-festivos
+./imputar-redmine.sh -c                  # configuración                            · --config
+./imputar-redmine.sh -h                  # ayuda                                    · --help
 ```
 
-El segundo argumento fija el **mes de trabajo** (`WORK_MONTH`). Si no se indica, es el mes actual.
+`-y` / `--yes` puede ir en cualquier posición y se combina con `-d`, `-s`, `-i` y `-n`.
+
+El segundo argumento fija el **mes de trabajo** (`WORK_MONTH`) en formato `AAAA-MM`; con `-f` también se admite `AAAA` (año). Si el primer argumento es un mes (`./imputar-redmine.sh 2026-09`), abre el menú en ese mes. Si no se indica, es el mes actual.
 
 ### Primer arranque (sin `.conf`)
 
@@ -101,7 +105,7 @@ Si no existe el fichero de configuración, el bloque de **arranque** lanza `setu
 - **No guarda nada hasta el final.** Mientras corre, `WIZARD=1` impide que `ensure_api` y `select_location` guarden por su cuenta. Al final muestra un resumen, y solo si se confirma llama a `save_config` y descarga los festivos (`cal_update`).
 - **Para probarlo** sin tocar la configuración real, usa `REDMINE_CONFIG=/tmp/nuevo.conf` apuntando a un fichero que no exista.
 
-Menú principal: `i` imputar · `d` imputar hoy rápido · `v` horas imputadas · `b` borrar/editar imputaciones · `f` festivos · `c` configuración · `?` ayuda · `q` salir · `←/→` cambiar de mes · `h` mes actual · `m` ir a un mes · `r` recargar · `n` simular.
+Menú principal: `i` imputar · `d` imputar hoy rápido · `v` horas imputadas · `b` borrar/editar imputaciones · `f` festivos · `c` configuración · `?` ayuda · `q` salir · `←/→` (o `a`/`s`) cambiar de mes · `h` mes actual · `m` ir a un mes · `r` recargar · `n` simular.
 
 ## Ficheros
 
@@ -352,6 +356,7 @@ Convenciones del código:
 8. **Entrada por stdin en funciones que preguntan**: no pases listas por tubería a una función que luego hace `ask`, porque se comería las respuestas. `pick_option` recibe la lista **como argumento** por eso.
 9. **Sin terminal** (stdin no es una terminal, como en pruebas con tubería): `read_key` devuelve `eof` al acabarse la entrada y los menús lo tratan como «salir/volver». `browse_months` y `browse_years` no entran en bucle si stdin no es una terminal.
 10. **El ámbito `scope` de la API no es fiable**: ver la sección de calendariosnacionales.
+11. **Sin terminal, las preguntas aceptan el valor por defecto.** Al agotarse la entrada (stdin vacío o redirigido, p. ej. en cron), `read` falla y la respuesta queda vacía: `ask` devuelve el valor por defecto, `confirm` (incluido el «¿Imputar?» final) responde **sí** y `confirm_no` responde **no**. Como los `cmd_*` se llaman en contexto `||`, `set -e` no lo corta. Consecuencia: `./imputar-redmine.sh -d` o `-s` **sin `-y`** y sin terminal imputa igual que con `-y`, pero **sin** sus salvaguardas (no aborta si los festivos no se pudieron cargar o faltan los locales). Para ejecuciones desatendidas usa siempre `-y`. `read_key` (menús y selector de periodo) sí devuelve `eof` y cancela.
 
 ---
 
@@ -384,7 +389,7 @@ Todo pasa por `cal_holidays_json` (JSON de un año) y `cal_holiday_lines` (JSON 
 
 ## Cómo probar sin riesgo
 
-No hay tests automáticos. Así se ha probado durante el desarrollo:
+No hay tests automáticos; la CI (`.github/workflows/shellcheck.yml`) ejecuta `bash -n` y `shellcheck -S warning` en cada push y pull request a `main`. Así se ha probado durante el desarrollo:
 
 ```bash
 bash -n imputar-redmine.sh                      # sintaxis
@@ -409,7 +414,7 @@ printf 'v\e[D\e[C\rq' | TERM=xterm script -qec ./imputar-redmine.sh /dev/null
 
 Para comprobar el aviso de cambios de festivos, altera a mano un fichero de `calendario/` con `jq` y ejecuta `-u`: tiene que mostrar las diferencias y dejar la versión buena de la API.
 
-> Las simulaciones (`-n`, tecla `n`) y `-r`/`-f` no escriben nada en Redmine. **Solo** escribe la confirmación «¿Imputar?» de `cmd_imputar`.
+> Las simulaciones (`-n`, tecla `n`) y `-r`/`-f` no escriben nada en Redmine. Solo escriben en Redmine la confirmación «¿Imputar?» de `cmd_imputar` (POST) y el borrado o la edición de `cmd_gestionar` (`-b`: DELETE / PUT).
 
 ---
 
